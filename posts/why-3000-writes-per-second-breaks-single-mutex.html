@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Why 3,000 Writes/Sec Breaks a Single Mutex: Lock Striping and H3 in Go — Dev Joshi</title>
+  <link rel="stylesheet" href="../style.css">
+  <style>
+    .svg-diagram {
+      background: #11151c;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 20px;
+      margin: 28px 0;
+      text-align: center;
+    }
+    .svg-caption {
+      font-family: var(--font-mono);
+      font-size: 12px;
+      color: var(--text-dim);
+      margin-top: 10px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <a href="../index.html" class="back-link">&larr; Back to all posts</a>
+
+    <article class="post-content">
+      <header class="post-header">
+        <h1 class="post-title">Why 3,000 Writes/Sec Breaks a Single Mutex: Lock Striping and H3 in Go</h1>
+        <div class="post-meta">PUBLISHED NOV 6, 2026 · 6 MIN READ · CONCURRENCY & GEOSPATIAL SYSTEMS</div>
+      </header>
+
+      <p>
+        Everyone writes a <code>sync.RWMutex</code> in Go to protect an in-memory map. It works fine in tutorials, but I hit a wall when taking this same concept into a geospatial matching engine (like Uber/Swiggy) that needs to track and update the live locations of thousands of delivery riders every few seconds.
+      </p>
+
+      <p>
+        Here is the architectural breakdown of why a single mutex collapses under geospatial load, why spherical geometry destroys CPU, and how we solved it using <strong>Uber H3</strong> and <strong>Dual Lock-Striping</strong>.
+      </p>
+
+      <h2>1. The Math Problem: Why Lat/Lng Destroys CPU</h2>
+      <p>
+        Tracking thousands of riders, pickups, and drop-offs using raw latitude and longitude coordinates requires continuous spherical trigonometry (the Haversine formula):
+      </p>
+
+      <pre><code>d = 2R · arcsin(√(sin²(Δφ/2) + cos(φ₁)·cos(φ₂)·sin²(Δλ/2)))</code></pre>
+
+      <p>
+        Running square roots and trigonometric functions on 10,000 live coordinates every few seconds burns CPU cycles. Furthermore, computers are terrible at spatial range queries on floats. Querying <em>"find all riders where distance &lt; 2km"</em> requires inspecting all candidates in the region.
+      </p>
+
+      <p>
+        To avoid this, we use <strong>Uber’s H3 spatial index</strong>, which partitions the entire planet into a hierarchical grid of hexagons.
+      </p>
+
+      <!-- SVG Diagram 1: Squares vs Hexagons -->
+      <div class="svg-diagram">
+        <svg viewBox="0 0 680 180" width="100%" height="180" xmlns="http://www.w3.org/2000/svg">
+          <!-- Square Grid -->
+          <g transform="translate(60, 20)">
+            <text x="75" y="15" fill="#8b949e" font-family="monospace" font-size="12" text-anchor="middle">SQUARE GRID (GEOHASH)</text>
+            <rect x="0" y="30" width="50" height="50" fill="#161b22" stroke="#30363d"/>
+            <rect x="50" y="30" width="50" height="50" fill="#161b22" stroke="#30363d"/>
+            <rect x="100" y="30" width="50" height="50" fill="#161b22" stroke="#30363d"/>
+            <rect x="0" y="80" width="50" height="50" fill="#161b22" stroke="#30363d"/>
+            <rect x="50" y="80" width="50" height="50" fill="#58a6ff33" stroke="#58a6ff" stroke-width="2"/>
+            <rect x="100" y="80" width="50" height="50" fill="#161b22" stroke="#30363d"/>
+            <line x1="75" y1="105" x2="125" y2="105" stroke="#3fb950" stroke-width="2"/>
+            <text x="100" y="100" fill="#3fb950" font-family="monospace" font-size="10" text-anchor="middle">1.0x</text>
+            <line x1="75" y1="105" x2="125" y2="55" stroke="#f85149" stroke-width="2" stroke-dasharray="3,3"/>
+            <text x="110" y="70" fill="#f85149" font-family="monospace" font-size="10">1.414x (Diagonal Distortion)</text>
+          </g>
+
+          <!-- Hex Grid -->
+          <g transform="translate(390, 20)">
+            <text x="110" y="15" fill="#8b949e" font-family="monospace" font-size="12" text-anchor="middle">UBER H3 (HEXAGONAL GRID)</text>
+            <!-- Center Hexagon -->
+            <polygon points="110,65 135,80 135,110 110,125 85,110 85,80" fill="#58a6ff33" stroke="#58a6ff" stroke-width="2"/>
+            <!-- Surrounding Hexagons -->
+            <polygon points="110,25 135,40 135,70 110,85 85,70 85,40" fill="#161b22" stroke="#30363d"/>
+            <polygon points="152,45 177,60 177,90 152,105 127,90 127,60" fill="#161b22" stroke="#30363d"/>
+            <polygon points="152,105 177,120 177,150 152,165 127,150 127,120" fill="#161b22" stroke="#30363d"/>
+            <polygon points="110,125 135,140 135,170 110,185 85,170 85,140" fill="#161b22" stroke="#30363d"/>
+            <polygon points="68,105 93,120 93,150 68,165 43,150 43,120" fill="#161b22" stroke="#30363d"/>
+            <polygon points="68,45 93,60 93,90 68,105 43,90 43,60" fill="#161b22" stroke="#30363d"/>
+            <circle cx="110" cy="95" r="3" fill="#3fb950"/>
+            <text x="110" y="145" fill="#3fb950" font-family="monospace" font-size="10" text-anchor="middle">All 6 neighbors: identical 1.0x distance</text>
+          </g>
+        </svg>
+        <div class="svg-caption">Figure 1: Squares suffer from a 41% diagonal distance penalty. Hexagons provide uniform neighbor expansion.</div>
+      </div>
+
+      <p>
+        When a rider travels from Connaught Place (CP) to Karol Bagh, their phone pings the server with raw coordinates every 3–4 seconds. H3 converts those coordinates into a single <strong>64-bit integer (<code>uint64</code>)</strong>. At Resolution 8, each hexagon represents an average city block (~461m edge length, ~0.737 km² area).
+      </p>
+
+      <p>
+        Searching for nearby riders transforms from slow trigonometric scanning into an in-memory key lookup: <em>"Find riders standing in Cell ID <code>0x882681a339fffff</code>, then expand outward to Ring 1 (6 neighbors)."</em>
+      </p>
+
+      <h2>2. The Single-Mutex Trap: Lock Starvation</h2>
+      <p>
+        Next, we have to update that rider’s cell in memory. Here is where the textbook Go tutorial pattern fails under load:
+      </p>
+
+      <pre><code>// The Naive Pattern (Collapses under load)
+type SpatialIndex struct {
+    mu    sync.RWMutex
+    cells map[uint64]map[string]struct{}
+}</code></pre>
+
+      <p>
+        Consider the real traffic profile of quick commerce in a city like Delhi or Bangalore:
+      </p>
+
+      <ul>
+        <li><strong>Traffic Load:</strong> 10,000 active riders sending GPS pings every 3.3 seconds = <strong>~3,000 writes/sec</strong>.</li>
+        <li><strong>Read Load:</strong> ~200 search reads/sec (radius queries for incoming customer orders).</li>
+        <li><strong>Write Frequency:</strong> A new write arrives every <strong>~333 microseconds</strong>.</li>
+      </ul>
+
+      <!-- SVG Diagram 2: Lock Contention Queue -->
+      <div class="svg-diagram">
+        <svg viewBox="0 0 680 140" width="100%" height="140" xmlns="http://www.w3.org/2000/svg">
+          <text x="340" y="20" fill="#f85149" font-family="monospace" font-size="12" font-weight="bold" text-anchor="middle">GLOBAL MUTEX BOTTLENECK (1 SINGLE DOOR)</text>
+          
+          <!-- Incoming Goroutines -->
+          <rect x="40" y="45" width="110" height="35" rx="4" fill="#161b22" stroke="#30363d"/>
+          <text x="95" y="67" fill="#8b949e" font-family="monospace" font-size="11" text-anchor="middle">Write #1 (CP)</text>
+
+          <rect x="160" y="45" width="110" height="35" rx="4" fill="#161b22" stroke="#30363d"/>
+          <text x="215" y="67" fill="#8b949e" font-family="monospace" font-size="11" text-anchor="middle">Write #2 (Noida)</text>
+
+          <rect x="280" y="45" width="110" height="35" rx="4" fill="#58a6ff22" stroke="#58a6ff"/>
+          <text x="335" y="67" fill="#58a6ff" font-family="monospace" font-size="11" text-anchor="middle">Order Read (CP)</text>
+
+          <!-- Single Lock Barrier -->
+          <rect x="440" y="35" width="60" height="65" rx="6" fill="#f8514922" stroke="#f85149" stroke-width="2"/>
+          <text x="470" y="65" fill="#f85149" font-family="monospace" font-size="12" font-weight="bold" text-anchor="middle">LOCK</text>
+          <text x="470" y="80" fill="#f85149" font-family="monospace" font-size="9" text-anchor="middle">100% Contention</text>
+
+          <!-- Database/Map -->
+          <rect x="540" y="40" width="100" height="50" rx="6" fill="#161b22" stroke="#3fb950"/>
+          <text x="590" y="70" fill="#3fb950" font-family="monospace" font-size="12" text-anchor="middle">Go Map</text>
+          
+          <line x1="390" y1="62" x2="435" y2="62" stroke="#f85149" stroke-width="2" marker-end="url(#arrow)"/>
+          <line x1="500" y1="62" x2="535" y2="62" stroke="#3fb950" stroke-width="2"/>
+        </svg>
+        <div class="svg-caption">Figure 2: In Go's sync.RWMutex, pending writes block new reads to prevent starvation, causing goroutine pileups.</div>
+      </div>
+
+      <p>
+        In Go’s runtime, <code>sync.RWMutex</code> is <strong>write-preferring</strong>. When a write calls <code>Lock()</code>, all subsequent <code>RLock()</code> readers are blocked until the writer releases.
+      </p>
+
+      <p>
+        Because a multi-ring spatial search inspects 7 to 19 neighboring cells, readers and writers form a single-file queue. 
+        P99 latency explodes from ~200 µs to <strong>45–80 milliseconds</strong>, and CPU time is wasted on goroutine parking (<code>runtime.park_m</code>) and scheduler overhead instead of servicing queries.
+      </p>
+
+      <h2>3. The Fix: 64-Way Lock Striping</h2>
+      <p>
+        The solution is to shard the data structure into fixed independent buckets—the exact same concept used in distributed storage engines, but implemented in-process:
+      </p>
+
+      <!-- SVG Diagram 3: Sharded Architecture -->
+      <div class="svg-diagram">
+        <svg viewBox="0 0 680 180" width="100%" height="180" xmlns="http://www.w3.org/2000/svg">
+          <text x="340" y="20" fill="#3fb950" font-family="monospace" font-size="12" font-weight="bold" text-anchor="middle">LOCK-STRIPED ARCHITECTURE (64 INDEPENDENT DOORS)</text>
+
+          <!-- Input Router -->
+          <rect x="30" y="70" width="120" height="40" rx="6" fill="#58a6ff22" stroke="#58a6ff"/>
+          <text x="90" y="95" fill="#58a6ff" font-family="monospace" font-size="11" text-anchor="middle">cellID & 63</text>
+
+          <!-- Shards -->
+          <g transform="translate(220, 35)">
+            <rect x="0" y="0" width="180" height="28" rx="4" fill="#161b22" stroke="#3fb950"/>
+            <text x="10" y="18" fill="#e6edf3" font-family="monospace" font-size="11">Shard 0  [Mutex 0]</text>
+            <text x="145" y="18" fill="#3fb950" font-family="monospace" font-size="10">46 req/s</text>
+
+            <rect x="0" y="38" width="180" height="28" rx="4" fill="#161b22" stroke="#3fb950"/>
+            <text x="10" y="56" fill="#e6edf3" font-family="monospace" font-size="11">Shard 1  [Mutex 1]</text>
+            <text x="145" y="56" fill="#3fb950" font-family="monospace" font-size="10">46 req/s</text>
+
+            <text x="90" y="90" fill="#8b949e" font-family="monospace" font-size="14" text-anchor="middle">···</text>
+
+            <rect x="0" y="100" width="180" height="28" rx="4" fill="#161b22" stroke="#3fb950"/>
+            <text x="10" y="118" fill="#e6edf3" font-family="monospace" font-size="11">Shard 63 [Mutex 63]</text>
+            <text x="145" y="118" fill="#3fb950" font-family="monospace" font-size="10">46 req/s</text>
+          </g>
+
+          <line x1="150" y1="80" x2="215" y2="50" stroke="#58a6ff" stroke-width="1.5"/>
+          <line x1="150" y1="90" x2="215" y2="88" stroke="#58a6ff" stroke-width="1.5"/>
+          <line x1="150" y1="100" x2="215" y2="148" stroke="#58a6ff" stroke-width="1.5"/>
+
+          <!-- Benefits -->
+          <g transform="translate(460, 45)">
+            <text x="0" y="20" fill="#3fb950" font-family="monospace" font-size="12">✓ 98.4% Less Contention</text>
+            <text x="0" y="50" fill="#3fb950" font-family="monospace" font-size="12">✓ 1-Cycle Bitwise Mask</text>
+            <text x="0" y="80" fill="#3fb950" font-family="monospace" font-size="12">✓ Sub-ms p99 Latency</text>
+          </g>
+        </svg>
+        <div class="svg-caption">Figure 3: Sharding partitions traffic. A write to Shard 1 does not freeze reads on Shard 63.</div>
+      </div>
+
+      <pre><code>type Shard struct {
+    mu    sync.RWMutex
+    cells map[uint64]map[string]struct{} // CellID -> Set[RiderID]
+}
+
+type SpatialIndex struct {
+    mask   uint64 // 63
+    shards [64]*Shard
+}</code></pre>
+
+      <div class="callout green">
+        <div class="callout-title">The Contention Math:</div>
+        <p style="margin:0;">
+          <strong>1 Global Lock:</strong> 3,000 writes/sec hitting 1 mutex = <strong>100% lock contention</strong>.<br>
+          <strong>64 Striped Locks:</strong> 3,000 writes/sec divided across 64 shards = <strong>~46.8 writes/sec per lock</strong>.<br>
+          <strong>Contention Reduction:</strong> 1 - (46.8 / 3000) = <strong>98.4% reduction in lock contention</strong>.
+        </p>
+      </div>
+
+      <p>
+        Because 64 is a power of 2 ($2^6$), finding which shard owns a cell bypasses the expensive integer modulo operator (<code>%</code>, which takes 10–40 CPU cycles) and uses bitwise AND (<strong>1 CPU clock cycle</strong>):
+      </p>
+
+      <pre><code>shardIdx := cellID & 63 // Single clock cycle instruction</code></pre>
+
+      <h2>4. The Trap: Why We Need Dual-Sharding</h2>
+      <p>
+        There is a trap if you only shard by <code>riderID</code>:
+      </p>
+      <p>
+        Updating where Rider #42 is becomes fast. But when an order drops and queries <em>"Which riders are inside H3 Cell <code>0x882681a339fffff</code>?"</em>, you would have to lock and scan <strong>all 64 shards</strong> to find which riders hold that cell ($O(N)$ full table scan in memory).
+      </p>
+
+      <p>
+        To make both <strong>location updates</strong> and <strong>radius searches</strong> $O(1)$ without global locks, we use <strong>Dual-Sharding</strong>:
+      </p>
+
+      <pre><code>// 1. Tracks where each rider is currently located (O(1) lookups)
+riderShards [64]*RiderShard // Sharded by hash(riderID)
+// riderID -> currentCellID
+
+// 2. Tracks who is inside each hexagon for spatial search (O(1) ring search)
+cellShards  [64]*CellShard  // Sharded by cellID & 63
+// cellID -> Set[riderID]</code></pre>
+
+      <h2>5. The Atomic Move Protocol</h2>
+      <p>
+        When Rider #42 moves from Connaught Place to Karol Bagh and pings their new GPS coordinates:
+      </p>
+
+      <ol>
+        <li><strong>Check previous cell:</strong> Hash <code>riderID</code>, lock only that bucket in <code>riderShards</code>, and look up <code>oldCellID</code>.</li>
+        <li><strong>Short-circuit:</strong> If <code>oldCellID == newCellID</code>, the rider stayed in the same hexagon. Release lock and <strong>return early</strong> (0 nanoseconds wasted on shard locks).</li>
+        <li><strong>Update rider location:</strong> If moved, write <code>newCellID</code> to <code>riderShards</code> and release the lock.</li>
+        <li><strong>Update spatial index:</strong>
+          <ul>
+            <li>Hash <code>oldCellID & 63</code>: lock that bucket in <code>cellShards</code> and remove Rider #42.</li>
+            <li>Hash <code>newCellID & 63</code>: lock the new bucket in <code>cellShards</code> and insert Rider #42.</li>
+          </ul>
+        </li>
+      </ol>
+
+      <p>
+        Instead of serializing city-wide traffic behind one mutex, updates only touch isolated buckets for a few nanoseconds. 
+        P99 lookup latency stays locked <strong>sub-millisecond (&lt; 300 µs)</strong> even during massive traffic spikes.
+      </p>
+
+      <div class="callout">
+        <div class="callout-title">Source Code</div>
+        <p style="margin:0;">
+          The full Go implementation with concurrent race tests is open source in the <a href="https://github.com/devjoshixo/hermes" target="_blank">Hermes repository</a>.
+        </p>
+      </div>
+    </article>
+
+    <footer>
+      <span>Dev Joshi &copy; 2026</span>
+      <a href="../index.html">&larr; Back to all posts</a>
+    </footer>
+  </div>
+</body>
+</html>
